@@ -1,0 +1,64 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "opencode/big-pickle",
+  "small_model": "opencode/big-pickle",
+  "enabled_providers": ["opencode"],
+  "provider": {"opencode": {"whitelist": ["big-pickle"]}},
+  "autoupdate": false,
+  "share": "disabled",
+  "instructions": ["docs/opencode-rules.md"],
+  "default_agent": "lab",
+  "permission": {
+    "*": "ask",
+    "read": {
+      "*": "allow",
+      "**/.aws/**": "deny",
+      "~/.aws/**": "deny",
+      "**/.env*": "deny",
+      "*.env*": "deny",
+      "**/*.pem": "deny",
+      "**/*.key": "deny",
+      "**/auth.json": "deny",
+      "**/credentials": "deny",
+      "**/.local/**": "deny"
+    },
+    "edit": {
+      "*": "ask",
+      "**/.aws/**": "deny",
+      "**/.env*": "deny",
+      "**/*.pem": "deny",
+      "**/*.key": "deny",
+      "**/auth.json": "deny",
+      "**/credentials": "deny"
+    },
+    "bash": {
+      "*": "ask",
+      "env": "deny",
+      "env *": "deny",
+      "printenv*": "deny",
+      "set -x*": "deny",
+      "aws *--debug*": "deny"
+    },
+    "external_directory": "deny",
+    "task": "deny"
+  },
+  "agent": {
+    "lab": {
+      "description": "課程實作助手：解釋命令、逐步確認、獨立驗收",
+      "mode": "primary",
+      "prompt": "使用繁體中文，遵守 AGENTS.md 與 docs/opencode-rules.md。區分環境測試與 AWS 實作。每個關鍵操作先解釋目的、完整命令、預期結果及影響，再等待核准。不要一次替學生完成整週或填寫個人報告。使用工具取得證據，不以自己的敘述宣稱實測完成。"
+    }
+  },
+  "command": {
+    "lab-plan": {
+      "description": "讀本週任務，提出小步驟計畫（不執行 AWS）",
+      "agent": "lab",
+      "template": "閱讀 AGENTS.md 與 $ARGUMENTS。只提出任務、預測題、成功與拒絕測試、資源及回收計畫；本次不要執行命令或修改檔案。"
+    },
+    "lab-check": {
+      "description": "檢查證據缺口，不代填報告",
+      "agent": "lab",
+      "template": "閱讀 $ARGUMENTS，對照當週任務，指出已有證據、缺少證據及未測項目。不要捏造結果、讀取秘密或代填學生個人解釋。本次只審閱。"
+    }
+  }
+}

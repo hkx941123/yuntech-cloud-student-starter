@@ -1,0 +1,39 @@
+name: Basic validation
+on:
+  push:
+    paths-ignore:
+      - 'docs/**'
+      - 'README.md'
+      - 'labs/**/README.md'
+  pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - 'README.md'
+      - 'labs/**/README.md'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  offline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: bash scripts/validate.sh
+  devcontainer:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm install --global @devcontainers/cli@0.80.1
+      - name: Build and start clean devcontainer
+        run: devcontainer up --workspace-folder .
+      - name: Verify installed tools and offline behavior
+        run: devcontainer exec --workspace-folder . bash scripts/validate.sh --environment
