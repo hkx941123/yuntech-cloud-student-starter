@@ -8,3 +8,4 @@
 |---|---|
 | W1–W2：環境與唯讀盤點 | [任務](labs/00-environment/README.md) |
 | W2：私有物件與短效分享 | [任務](labs/02-private-s3/README.md) |
+| W3：巡檢服務雛型上線 | [Sprint 任務](labs/03-service-prototype/README.md) |
