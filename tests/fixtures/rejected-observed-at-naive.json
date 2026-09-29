@@ -1,0 +1,11 @@
+{
+  "_comment": "拒絕案例 A：observed_at 能被解析，但沒有時區（例如 2026-09-29T10:00:00）。預期 400，field 為 observed_at。其餘欄位必須合法，否則 400 會落在別的欄位。",
+  "expected_status": 400,
+  "expected_field": "observed_at",
+  "body": {
+    "event_id": "g03-m2-0002",
+    "device_id": "g03-d01",
+    "observed_at": "2026-09-29T10:00:00",
+    "type": "status"
+  }
+}

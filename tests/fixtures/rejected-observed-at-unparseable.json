@@ -1,0 +1,11 @@
+{
+  "_comment": "拒絕案例 B：observed_at 根本不是 ISO 8601，連解析都會失敗。預期 400，field 為 observed_at。注意 2026-09-29 或 2026-09-29 10:00:00 在新版 Python 解析得成功（算無時區），要寫真正壞掉的格式。",
+  "expected_status": 400,
+  "expected_field": "observed_at",
+  "body": {
+    "event_id": "g03-m2-0003",
+    "device_id": "g03-d01",
+    "observed_at": "2026-09-29 10:00 台北",
+    "type": "status"
+  }
+}
