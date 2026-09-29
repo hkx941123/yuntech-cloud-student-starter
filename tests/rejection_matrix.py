@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """拒絕矩陣：一次跑完 7 列，比對預期與實際。
 
+輸出格式照 reports/W04_繳交範本.md 第 2 段的要求：
+開頭先印 /health 的 version，接著每一列印編號、說明、預期、實際狀態碼與服務回應的本文。
+回應本文不會包含權杖——服務的錯誤回應只有 error 與 field 兩欄，成功回應只有事件欄位。
+
 兩種模式：
 
     # 離線自我測試（預設）：在本機 127.0.0.1 起服務，用合成權杖，不碰 AWS
@@ -10,7 +14,6 @@
     set -a; source .local/app.env; set +a
     python3 tests/rejection_matrix.py --base-url http://<主機位址>
 
-安全界線：權杖只從環境變數讀取，永遠不出現在輸出、引數或錯誤訊息裡。
 事件本文取自 tests/fixtures/，所以矩陣跑的內容就是你在 T2 寫的那幾筆。
 """
 import argparse
@@ -33,6 +36,8 @@ FIXTURES = TESTS_DIR / "fixtures"
 # 離線模式專用的合成權杖：不是任何人的真實權杖，也不會被部署到主機。
 LOCAL_REPORTER = "local-dry-run-reporter-token-not-a-secret"
 LOCAL_OPERATOR = "local-dry-run-operator-token-not-a-secret"
+
+BODY_LIMIT = 1000
 
 ROW_LABELS = {
     1: "reporter 送一筆合法事件",
@@ -78,33 +83,45 @@ def call(base, method, path, body=None, token=None):
         return caught.code, json.loads(caught.read().decode("utf-8", "replace") or "null")
 
 
+def render(payload):
+    """把回應本文壓成單行 JSON；不印權杖（服務本來就不回顯）。"""
+    text = json.dumps(payload, ensure_ascii=False)
+    return text if len(text) <= BODY_LIMIT else text[:BODY_LIMIT] + "…（已截斷）"
+
+
 def run_matrix(base, reporter, operator, event_id, id_was_fixed):
-    """依序跑 7 列，回傳 [(編號, 預期, 實際, 是否通過, 備註), ...]。"""
+    """依序跑 7 列，回傳 [(編號, 預期, 實際, 是否通過, 備註, 回應本文), ...]。"""
     good = dict(load_fixture("accepted.json")["body"], event_id=event_id)
     naive = load_fixture("rejected-observed-at-naive.json")["body"]
     results = []
 
-    def record(number, expected, actual, note=""):
-        results.append((number, expected, actual, actual == expected, note))
+    def record(number, expected, actual, payload=None, note=""):
+        results.append((number, expected, actual, actual == expected, note, payload))
 
-    status, _ = call(base, "POST", "/events", good, reporter)
+    status, payload = call(base, "POST", "/events", good, reporter)
     if id_was_fixed and status == 409:
         # 明確指定 --event-id 且主機上已有該筆：建立本來就該是衝突。
-        record(1, 201, 409, "此 event_id 先前已送出，#1 改記為衝突")
+        record(1, 201, 409, payload, "此 event_id 先前已送出，#1 改記為衝突")
     else:
-        record(1, 201, status)
+        record(1, 201, status, payload)
 
-    record(2, 401, call(base, "POST", "/events", good)[0])
-    record(3, 403, call(base, "POST", "/events", good, operator)[0])
-    record(4, 400, call(base, "POST", "/events", naive, reporter)[0])
-    record(5, 409, call(base, "POST", "/events", good, reporter)[0])
-    record(6, 403, call(base, "GET", "/events", None, reporter)[0])
+    status, payload = call(base, "POST", "/events", good)
+    record(2, 401, status, payload)
+    status, payload = call(base, "POST", "/events", good, operator)
+    record(3, 403, status, payload)
+    status, payload = call(base, "POST", "/events", naive, reporter)
+    record(4, 400, status, payload)
+    status, payload = call(base, "POST", "/events", good, reporter)
+    record(5, 409, status, payload)
+    status, payload = call(base, "GET", "/events", None, reporter)
+    record(6, 403, status, payload)
 
     status, payload = call(base, "GET", "/events", None, operator)
     identifiers = []
     if isinstance(payload, dict):
         identifiers = [item.get("event_id") for item in payload.get("events", [])]
-    record(7, 200, status, "" if event_id in identifiers else "清單查得到，但沒有 #1 的 event_id")
+    record(7, 200, status, payload,
+           "" if event_id in identifiers else "清單查得到，但沒有 #1 的 event_id")
     return results
 
 
@@ -133,10 +150,15 @@ def main():
     fixed = bool(args.event_id)
     seed = load_fixture("accepted.json")["body"]["event_id"]
     event_id = args.event_id or seed + "-" + secrets.token_hex(4)
+
+    # 繳交範本要求輸出開頭就有 version。
+    health_status, health = call(base, "GET", "/health")
+    print("服務版本（/health，HTTP {}）：{}".format(
+        health_status, health.get("version", "（無）") if isinstance(health, dict) else "（無）"))
+    print("auth_configured：{}".format(
+        health.get("auth_configured") if isinstance(health, dict) else "（無）"))
     print("第 1 列 event_id：" + event_id)
     print()
-    print("| # | 請求 | 預期 | 實際 | 結果 |")
-    print("| --- | --- | --- | --- | --- |")
     try:
         results = run_matrix(base, reporter, operator, event_id, fixed)
     finally:
@@ -146,12 +168,13 @@ def main():
         if workspace is not None:
             workspace.cleanup()
 
-    for number, expected, actual, passed, note in results:
-        line = "| {n} | {d} | {e} | {a} | {r} |".format(
-            n=number, d=ROW_LABELS[number], e=expected, a=actual,
-            r="PASS" if passed else "FAIL")
-        print(line + ("（" + note + "）" if note else ""))
-    failures = [r[0] for r in results if not r[3]]
+    for number, expected, actual, passed, note, payload in results:
+        print("#{} {}".format(number, ROW_LABELS[number]))
+        print("   預期 {}　實際 {}　{}".format(expected, actual, "PASS" if passed else "FAIL"))
+        print("   回應 " + render(payload))
+        if note:
+            print("   備註 " + note)
+    failures = [row[0] for row in results if not row[3]]
     print()
     print("通過 {ok}/{total}".format(ok=len(results) - len(failures), total=len(results))
           + ("，失敗列：" + ", ".join(str(n) for n in failures) if failures else ""))
