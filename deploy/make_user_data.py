@@ -43,6 +43,7 @@ After=network.target
 [Service]
 Type=simple
 User=inspection
+EnvironmentFile=-/etc/inspection/app.env
 WorkingDirectory=/opt/inspection/app
 ExecStart=/usr/bin/python3 /opt/inspection/app/service.py
 Restart=on-failure
@@ -57,6 +58,8 @@ W3_UNIT
 systemctl daemon-reload
 nginx -t
 systemctl enable --now inspection nginx
+systemctl restart inspection
+systemctl reload nginx
 """.replace("PAYLOAD", payload)
     data = script.encode()
     if len(data) >= 16 * 1024:
