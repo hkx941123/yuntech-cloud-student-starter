@@ -1,12 +1,11 @@
 {
-  "_comment": "成功案例。body 就是會被送到 POST /events 的本文。observed_at 必須帶時區。note 可以整行刪掉（選填）。目前是範例值，提交前請換成你自己的組別代號。",
+  "_comment": "成功案例。body 就是會被送到 POST /events 的本文。observed_at 必須帶時區。note 可以整行刪掉（選填）。",
   "expected_status": 201,
   "expected_field": null,
   "body": {
-    "event_id": "g03-m2-0001",
-    "device_id": "g03-d01",
+    "event_id": "g01-m2-0001",
+    "device_id": "g01-d01",
     "observed_at": "2026-09-29T10:00:00+08:00",
-    "type": "status",
-    "note": "第一次巡檢"
+    "type": "status"
   }
 }

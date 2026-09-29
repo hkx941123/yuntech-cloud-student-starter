@@ -3,8 +3,8 @@
   "expected_status": 400,
   "expected_field": "observed_at",
   "body": {
-    "event_id": "g03-m2-0003",
-    "device_id": "g03-d01",
+    "event_id": "g01-m2-0003",
+    "device_id": "g01-d01",
     "observed_at": "2026-09-29 10:00 台北",
     "type": "status"
   }
