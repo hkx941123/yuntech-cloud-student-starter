@@ -77,6 +77,28 @@ timeout 8 bash -c 'echo > /dev/tcp/<你的 RDS 位址>/5432' && echo "連得到�
 4. 密碼由腳本產生、寫進 `.local/db.env`（600），不顯示，也不能出現在命令列參數。
 5. 每建一項就把 ID 寫進 `.local/resources.json`；結束時讀回 `available` 與 `PubliclyAccessible=false`。
 
+### `db-up.sh` 的本機設定
+
+`deploy/db-up.sh` 需要 `.local/w05.conf` 指定兩段經檢查不重疊的 `/24`、兩個不同 AZ、RDS identifier 與你依當期區域價格確認的月預算上限；組名與組內代號沿用 `.local/w03.conf`，也可在 W5 設定檔覆寫。範例：
+
+```text
+DB_SUBNET_1_CIDR=172.31.240.0/24
+DB_SUBNET_1_AZ=us-east-1a
+DB_SUBNET_2_CIDR=172.31.241.0/24
+DB_SUBNET_2_AZ=us-east-1b
+DB_INSTANCE_IDENTIFIER=w05-g03-m2-db
+DB_MONTHLY_BUDGET_USD=確認後填入你的月預算上限
+DB_SUBNET_1_CIDR=172.31.96.0/24
+DB_SUBNET_1_AZ=us-east-1a
+DB_SUBNET_2_CIDR=172.31.97.0/24
+DB_SUBNET_2_AZ=us-east-1b
+DB_INSTANCE_IDENTIFIER=w05-g03-m2-db
+DB_MONTHLY_BUDGET_USD=25
+
+```
+
+CIDR 和 AZ 只是格式範例，不能直接照抄；先依 README 核對你的 VPC、現有子網與可用 AZ，並用當期官方價格估算預算。預算欄只是你的成本目標，不是 AWS 帳單上限或自動警報。先執行 `bash deploy/db-up.sh --dry-run` 檢查唯讀驗證和資源清單，再由本人審查正式執行計畫。正式執行會等待互動確認，建立前不會寫入 AWS。若建立中途失敗，先核對 `.local/resources.json` 的每個 ID 與 AWS 現況；只有確認失敗前已建立的資源都在清單內、且沒有已存在的 RDS 執行個體或 `.local/db.env` 時，才可用 `bash deploy/db-up.sh --resume --dry-run` 預檢後再 `bash deploy/db-up.sh --resume`。不要直接重跑一般模式，以免建立重複資源。
+
 `deploy.sh` 本週多一件事：把 `.local/db.env` 的內容一起放進主機的秘密檔，放完再重啟服務。
 
 ## 冪等規則
@@ -95,6 +117,8 @@ timeout 8 bash -c 'echo > /dev/tcp/<你的 RDS 位址>/5432' && echo "連得到�
 ### 冪等矩陣（T3，請 Copilot 寫成一支小腳本一次跑完）
 
 腳本的輸出要能直接貼進繳交範本：開頭印出主機 `/health` 的 `version` 和 `db_configured`；每一列印出編號、HTTP 狀態碼、服務回應的本文；第 5 列印出 EC2 上 `psql` 查到的筆數。不要印出權杖、密碼或請求標頭。
+
+執行 `python3 tests/w05_idempotency_matrix.py`。腳本會先執行 `bash scripts/verify-aws.sh`，再唯讀確認資源清單中的 EC2 仍在執行、擁有權標籤正確，並取得目前 IP；接著在確認前列出將保留的唯一測試事件、要重啟的服務、零 AWS 資源變更與回復方式，需輸入 `T3-MATRIX` 才會繼續。測試事件會留在 RDS 作為證據，不會自動刪除。矩陣標準輸出會以 `version=` 和 `db_configured=` 開頭；確認計畫則列在錯誤輸出。整段矩陣標準輸出複製到繳交範本；不要自行改寫或把預期值填成實測值。
 
 | # | 做什麼 | 預期 |
 |---|---|---|

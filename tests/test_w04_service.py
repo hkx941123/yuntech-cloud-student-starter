@@ -12,6 +12,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_DIR = Path(__file__).with_name("fixtures")
@@ -174,6 +175,7 @@ class Authenticated(ServiceBase):
         status, payload = self.call("GET", "/health")
         self.assertEqual(status, 200)
         self.assertTrue(payload["auth_configured"])
+        self.assertFalse(payload["db_configured"])
         self.assertEqual(payload["version"], "b" * 40)
 
     def test_oversize_body_is_rejected(self):
@@ -205,6 +207,59 @@ class FailsClosed(ServiceBase):
         self.assertEqual(self.call("GET", "/events", token=OPERATOR)[0], 401)
 
 
+class DatabaseBacked(ServiceBase):
+    env = {"REPORTER_TOKEN": REPORTER, "OPERATOR_TOKEN": OPERATOR}
+
+    def setUp(self):
+        self.settings_patch = mock.patch.object(
+            service, "_database_settings", return_value={"host": "test"}
+        )
+        self.settings_patch.start()
+        self.addCleanup(self.settings_patch.stop)
+        super().setUp()
+
+    def test_health_marks_database_configured_without_connecting(self):
+        with mock.patch.object(service, "_ensure_events_table") as ensure:
+            status, payload = self.call("GET", "/health")
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["db_configured"])
+        ensure.assert_not_called()
+
+    def test_database_duplicate_statuses_are_returned_by_the_api(self):
+        payload = {
+            "event_id": "event-db",
+            "device_id": "device-db",
+            "observed_at": "2025-01-01T00:00:00Z",
+            "type": "test",
+        }
+        record = dict(payload, received_at="2025-01-01T00:00:00Z")
+        responses = [
+            (201, record),
+            (200, record),
+            (409, {"error": "duplicate_event_id", "field": "event_id"}),
+        ]
+        with (mock.patch.object(service, "_ensure_events_table") as ensure,
+              mock.patch.object(service, "_db_create_event", side_effect=responses)):
+            results = [
+                self.call("POST", "/events", payload, REPORTER)
+                for _ in responses
+            ]
+        self.assertEqual([status for status, _ in results], [201, 200, 409])
+        self.assertEqual(ensure.call_count, 1)
+
+    def test_database_errors_return_generic_service_unavailable_response(self):
+        with mock.patch.object(
+            service, "_ensure_events_table",
+            side_effect=RuntimeError("do-not-leak-this-database-detail"),
+        ):
+            status, payload = self.call(
+                "POST", "/events", next(iter(ACCEPTED.values()))["body"], REPORTER
+            )
+        self.assertEqual(status, 503)
+        self.assertEqual(payload, {"error": "database_unavailable", "field": None})
+        self.assertNotIn("do-not-leak", json.dumps(payload))
+
+
 class SourceHygiene(unittest.TestCase):
     def test_service_source_avoids_unsafe_dom_and_browser_storage(self):
         text = SERVICE_PATH.read_text(encoding="utf-8")
@@ -213,8 +268,96 @@ class SourceHygiene(unittest.TestCase):
 
     def test_service_source_does_not_print_or_log_request_data(self):
         text = SERVICE_PATH.read_text(encoding="utf-8")
-        for banned in ("print(", "logging.", "logger"):
+        for banned in ("print(", "logging.exception", "exc_info=True"):
             self.assertNotIn(banned, text)
+        self.assertIn('logger.warning("%s failed (%s)"', text)
+
+
+class DatabaseWrites(unittest.TestCase):
+    def test_identical_duplicate_returns_existing_record_without_insert(self):
+        existing = ("event-1", "device-1", "2025-01-01T00:00:00Z", "test",
+                    "same", service.datetime.now(service.timezone.utc))
+
+        class Cursor:
+            def __init__(self):
+                self.calls = []
+                self.rows = [None, existing]
+
+            def execute(self, query, params=None):
+                self.calls.append((query, params))
+
+            def fetchone(self):
+                return self.rows.pop(0)
+
+        cursor = Cursor()
+        payload = {
+            "event_id": "event-1",
+            "device_id": "device-1",
+            "observed_at": "2025-01-01T00:00:00Z",
+            "type": "test",
+            "note": "same",
+        }
+        with mock.patch.object(service, "_db_cursor",
+                               side_effect=lambda settings, operation: operation(cursor)):
+            status, record = service._db_create_event({}, payload)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(record["event_id"], "event-1")
+        self.assertIn("ON CONFLICT (event_id) DO NOTHING", cursor.calls[0][0])
+        self.assertEqual(cursor.calls[0][1], (
+            "event-1", "device-1", "2025-01-01T00:00:00Z", "test", "same"))
+        self.assertEqual(cursor.calls[1][1], ("event-1",))
+
+    def test_different_duplicate_content_returns_conflict(self):
+        existing = ("event-1", "device-1", "2025-01-01T00:00:00Z", "test",
+                    "original", service.datetime.now(service.timezone.utc))
+
+        class Cursor:
+            def __init__(self):
+                self.rows = [None, existing]
+
+            def execute(self, query, params=None):
+                pass
+
+            def fetchone(self):
+                return self.rows.pop(0)
+
+        payload = {
+            "event_id": "event-1",
+            "device_id": "device-1",
+            "observed_at": "2025-01-01T00:00:00Z",
+            "type": "test",
+            "note": "changed",
+        }
+        with mock.patch.object(service, "_db_cursor",
+                               side_effect=lambda settings, operation: operation(Cursor())):
+            status, response = service._db_create_event({}, payload)
+
+        self.assertEqual(status, 409)
+        self.assertEqual(response, {"error": "duplicate_event_id", "field": "event_id"})
+
+    def test_inserted_event_returns_created(self):
+        inserted = ("event-1", "device-1", "2025-01-01T00:00:00Z", "test",
+                    None, service.datetime.now(service.timezone.utc))
+
+        class Cursor:
+            def execute(self, query, params=None):
+                self.params = params
+
+            def fetchone(self):
+                return inserted
+
+        with mock.patch.object(service, "_db_cursor",
+                               side_effect=lambda settings, operation: operation(Cursor())):
+            status, record = service._db_create_event({}, {
+                "event_id": "event-1",
+                "device_id": "device-1",
+                "observed_at": "2025-01-01T00:00:00Z",
+                "type": "test",
+            })
+
+        self.assertEqual(status, 201)
+        self.assertEqual(record["event_id"], "event-1")
 
 
 if __name__ == "__main__":

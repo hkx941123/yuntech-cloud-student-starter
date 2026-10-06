@@ -24,6 +24,7 @@ COMMIT=""
 KEY="${HOME}/.ssh/w03-t1"
 SSH_USER="ec2-user"
 SECRET_FILE=".local/app.env"
+DB_SECRET_FILE=".local/db.env"
 RESOURCES=".local/resources.json"
 CONF=".local/w03.conf"
 HEALTH_TRIES=12
@@ -76,13 +77,20 @@ else
     stop "找不到 $SECRET_FILE。請先在自己終端機產生權杖並 chmod 600。"
   fi
 fi
+if [[ ! -f "$DB_SECRET_FILE" ]]; then
+  stop "找不到 $DB_SECRET_FILE。W5 部署需要資料庫設定。"
+fi
+DB_SECRET_MODE="$(stat -c '%a' "$DB_SECRET_FILE")"
+if [[ "$DB_SECRET_MODE" != "600" ]]; then
+  stop "$DB_SECRET_FILE 權限是 $DB_SECRET_MODE，必須先 chmod 600。"
+fi
 if [[ -z "$COMMIT" ]]; then
   COMMIT="$(git rev-parse --verify --end-of-options 'HEAD^{commit}')"
 fi
 COMMIT="$(git rev-parse --verify --end-of-options "$COMMIT^{commit}")"
 SHORT="${COMMIT:0:7}"
 INSTANCE_ID="$(python3 -c 'import json,pathlib,sys;print(json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["instance"]["id"])' "$RESOURCES")"
-note "本機檢查完成：instance $INSTANCE_ID、commit $COMMIT、秘密檔權限 $SECRET_MODE"
+note "本機檢查完成：instance $INSTANCE_ID、commit $COMMIT、app secrets=$SECRET_MODE、DB secrets=$DB_SECRET_MODE"
 
 # ---------------------------------------------------------------- 步驟 1：身分
 note ""
@@ -164,7 +172,8 @@ note "  部署版本  : $COMMIT"
 note "  安裝腳本  : $PACKAGE（只含 app/service.py、deploy/nginx.conf、app/version）"
 note "  主機上會被覆寫：/opt/inspection/**、/etc/nginx/nginx.conf、"
 note "                 /etc/systemd/system/inspection.service、/etc/inspection/app.env"
-note "  會重啟 inspection：記憶體事件會清空（現在還沒有 /events，沒有資料損失）"
+note "  會將 app.env + db.env 經 SSH 標準輸入合併寫入主機（root:600）"
+note "  會重啟 inspection：W4 記憶體事件會清空；RDS 事件不受影響"
 note "  AWS 資源  : 建立 0、變更 0、刪除 0；SG 與 IAM 不動"
 note "  回滾方式  : bash deploy/deploy.sh --commit <前一個 commit>"
 
@@ -177,7 +186,7 @@ fi
 [[ -t 0 ]] || stop "需要互動式終端機輸入確認字串。請你在自己的終端機執行本指令。"
 TOKEN="DEPLOY-$SHORT"
 printf '\n輸入 %s 繼續部署（其他任何輸入都會中止）: ' "$TOKEN"
-ANSWER="$(read -r)"
+read -r ANSWER
 [[ "$ANSWER" == "$TOKEN" ]] || stop "已中止，沒有做任何變更。"
 
 # ---------------------------------------------------------------- 步驟 5：打包
@@ -196,12 +205,16 @@ ssh "${SSH_OPTS[@]}" "$SSH_USER@$PUBLIC_IP" 'sudo -n bash -s' <"$PACKAGE" \
 # ---------------------------------------------------------------- 步驟 7：秘密檔 + 重啟
 note ""
 note "== 放置秘密檔並重啟服務 =="
-ssh "${SSH_OPTS[@]}" "$SSH_USER@$PUBLIC_IP" \
-  'sudo -n install -d -m 700 /etc/inspection &&
+{
+  cat "$SECRET_FILE"
+  printf '\n'
+  cat "$DB_SECRET_FILE"
+} | ssh "${SSH_OPTS[@]}" "$SSH_USER@$PUBLIC_IP" \
+  'sudo -n install -d -m 755 /etc/inspection &&
    sudo -n tee /etc/inspection/app.env >/dev/null &&
    sudo -n chmod 600 /etc/inspection/app.env &&
    sudo -n chown root:root /etc/inspection/app.env &&
-   sudo -n systemctl restart inspection' <"$SECRET_FILE" \
+   sudo -n systemctl restart inspection' \
   || stop "秘密檔或重啟失敗。請檢查 /etc/inspection/app.env 是否存在且為 root 600。"
 
 # ---------------------------------------------------------------- 步驟 8：驗證
@@ -210,7 +223,7 @@ note "== 驗證 /health =="
 BODY=""
 for attempt in $(seq 1 "$HEALTH_TRIES"); do
   sleep "$HEALTH_WAIT"
-  BODY="$(curl -4 -sS --max-time 8 "http://$PUBLIC_IP/health" 2>/dev/null || true)"
+  BODY="$(curl --noproxy '*' -4 -sS --max-time 8 "http://$PUBLIC_IP/health" 2>/dev/null || true)"
   VERSION="$(python3 -c '
 import json, sys
 try:
@@ -231,10 +244,13 @@ if body.get("version") != sys.argv[2]:
     raise SystemExit("STOP: version 不是這次的 commit（主機上目前是 " + str(body.get("version")) + "）。")
 if body.get("auth_configured") is not True:
     raise SystemExit("STOP: auth_configured 不是 true，服務沒有讀到 /etc/inspection/app.env。")
+if body.get("db_configured") is not True:
+    raise SystemExit("STOP: db_configured 不是 true，服務沒有讀到 /etc/inspection/app.env 的資料庫設定。")
 print("  version 等於 " + sys.argv[2])
 print("  auth_configured = true")
+print("  db_configured = true")
 ' "$BODY" "$COMMIT" || stop "驗證未通過；主機上目前是什麼版本請自行用 /health 確認，不要猜。"
 
 note ""
-note "部署完成：$COMMIT → $PUBLIC_IP（健康頁 version 與 auth_configured 都已核對）"
+note "部署完成：$COMMIT → $PUBLIC_IP（version、auth_configured、db_configured 都已核對）"
 note "回滾：bash deploy/deploy.sh --commit <前一個 commit>"
