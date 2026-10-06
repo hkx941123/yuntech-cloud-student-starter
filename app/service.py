@@ -13,6 +13,7 @@ Events live in process memory and are lost when the service restarts.
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -29,6 +30,10 @@ EVENT_TYPES = frozenset({"status", "anomaly", "test"})
 EVENT_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 DEVICE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
 EVENT_PATH_RE = re.compile(r"/events/([^/]+)")
+DATABASE_FIELDS = ("DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD")
+DATABASE_CA_ENV = "DB_CA_CERT"
+DATABASE_CA_DEFAULT = "/etc/inspection/rds-ca.pem"
+logger = logging.getLogger("inspection")
 
 
 def _now():
@@ -67,6 +72,164 @@ def _validate(payload):
         if not isinstance(note, str) or len(note) > MAX_NOTE_CHARS:
             return 400, {"error": "invalid_field", "field": "note"}
     return None
+
+
+def _database_settings(source):
+    values = {name: (source.get(name) or "").strip() for name in DATABASE_FIELDS}
+    ca_cert = (source.get(DATABASE_CA_ENV) or DATABASE_CA_DEFAULT).strip()
+    if not all(values.values()) or not Path(ca_cert).is_file():
+        return None
+    try:
+        port = int(source.get("DB_PORT") or "5432")
+    except ValueError:
+        return None
+    if not 1 <= port <= 65535:
+        return None
+    values.update({"ca_cert": ca_cert, "port": port})
+    return values
+
+
+def _connect_database(settings):
+    import psycopg2
+
+    return psycopg2.connect(
+        host=settings["DB_HOST"],
+        port=settings["port"],
+        dbname=settings["DB_NAME"],
+        user=settings["DB_USER"],
+        password=settings["DB_PASSWORD"],
+        sslmode="verify-full",
+        sslrootcert=settings["ca_cert"],
+        connect_timeout=5,
+    )
+
+
+def _db_cursor(settings, operation):
+    connection = _connect_database(settings)
+    try:
+        cursor = connection.cursor()
+        try:
+            result = operation(cursor)
+            connection.commit()
+            return result
+        finally:
+            cursor.close()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def _ensure_events_table(settings):
+    def create(cursor):
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS events (
+                event_id TEXT PRIMARY KEY,
+                device_id TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                note TEXT,
+                received_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+    _db_cursor(settings, create)
+
+
+def _db_record(row):
+    record = {
+        "event_id": row[0],
+        "device_id": row[1],
+        "observed_at": row[2],
+        "type": row[3],
+        "received_at": row[5].astimezone(timezone.utc).isoformat(
+            timespec="seconds"
+        ).replace("+00:00", "Z"),
+    }
+    if row[4] is not None:
+        record["note"] = row[4]
+    return record
+
+
+def _db_list_events(settings):
+    def select(cursor):
+        cursor.execute(
+            """
+            SELECT event_id, device_id, observed_at, event_type, note, received_at
+            FROM events ORDER BY received_at DESC, event_id LIMIT %s
+            """,
+            (LIST_LIMIT,),
+        )
+        return [_db_record(row) for row in cursor.fetchall()]
+
+    return _db_cursor(settings, select)
+
+
+def _db_get_event(settings, event_id):
+    def select(cursor):
+        cursor.execute(
+            """
+            SELECT event_id, device_id, observed_at, event_type, note, received_at
+            FROM events WHERE event_id = %s
+            """,
+            (event_id,),
+        )
+        row = cursor.fetchone()
+        return _db_record(row) if row else None
+
+    return _db_cursor(settings, select)
+
+
+def _db_create_event(settings, payload):
+    def create(cursor):
+        cursor.execute(
+            """
+            INSERT INTO events (event_id, device_id, observed_at, event_type, note)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (event_id) DO NOTHING
+            RETURNING event_id, device_id, observed_at, event_type, note, received_at
+            """,
+            (
+                payload["event_id"],
+                payload["device_id"],
+                payload["observed_at"],
+                payload["type"],
+                payload.get("note"),
+            ),
+        )
+        inserted = cursor.fetchone()
+        if inserted:
+            return 201, _db_record(inserted)
+
+        cursor.execute(
+            """
+            SELECT event_id, device_id, observed_at, event_type, note, received_at
+            FROM events WHERE event_id = %s
+            """,
+            (payload["event_id"],),
+        )
+        existing = cursor.fetchone()
+        if not existing:
+            raise RuntimeError("conflicting event disappeared before it could be read")
+        same_content = (
+            existing[1] == payload["device_id"]
+            and existing[2] == payload["observed_at"]
+            and existing[3] == payload["type"]
+            and existing[4] == payload.get("note")
+        )
+        if same_content:
+            return 200, _db_record(existing)
+        return 409, {"error": "duplicate_event_id", "field": "event_id"}
+
+    return _db_cursor(settings, create)
+
+
+def _database_failure(operation, exc):
+    logger.warning("%s failed (%s)", operation, type(exc).__name__)
+    return {"error": "database_unavailable", "field": None}
 
 
 def _list_page():
@@ -141,11 +304,27 @@ def make_server(version_file, port=8080, env=None):
     reporter_token = (source.get("REPORTER_TOKEN") or "").strip()
     operator_token = (source.get("OPERATOR_TOKEN") or "").strip()
     auth_configured = bool(reporter_token) and bool(operator_token)
+    database_settings = _database_settings(source)
+    database_configured = database_settings is not None
+    database_ready = False
+    database_lock = threading.Lock()
 
     lock = threading.Lock()
     events = {}
 
     class Handler(BaseHTTPRequestHandler):
+        def ensure_database(self):
+            nonlocal database_ready
+            if database_ready:
+                return
+            with database_lock:
+                if not database_ready:
+                    _ensure_events_table(database_settings)
+                    database_ready = True
+
+        def send_database_error(self, operation, exc):
+            self.send_json(503, _database_failure(operation, exc))
+
         def setup(self):
             super().setup()
             self.connection.settimeout(5)
@@ -201,7 +380,8 @@ def make_server(version_file, port=8080, env=None):
             if path == "/health":
                 self.send_json(200, {"status": "ok", "service": "inspection",
                                      "version": version, "started_at": started,
-                                     "auth_configured": auth_configured})
+                                     "auth_configured": auth_configured,
+                                     "db_configured": database_configured})
                 return
             if path == "/":
                 self.send_page(200, _list_page())
@@ -209,16 +389,33 @@ def make_server(version_file, port=8080, env=None):
             if path == "/events":
                 if self.require_role("operator") is None:
                     return
-                with lock:
-                    items = list(events.values())[-LIST_LIMIT:]
+                if database_configured:
+                    try:
+                        self.ensure_database()
+                        items = _db_list_events(database_settings)
+                    except Exception as exc:
+                        self.send_database_error("database list", exc)
+                        return
+                else:
+                    with lock:
+                        items = list(events.values())[-LIST_LIMIT:]
                 self.send_json(200, {"events": items, "count": len(items)})
                 return
             match = EVENT_PATH_RE.fullmatch(path)
             if match:
                 if self.require_role("operator") is None:
                     return
-                with lock:
-                    record = events.get(unquote(match.group(1)))
+                event_id = unquote(match.group(1))
+                if database_configured:
+                    try:
+                        self.ensure_database()
+                        record = _db_get_event(database_settings, event_id)
+                    except Exception as exc:
+                        self.send_database_error("database get", exc)
+                        return
+                else:
+                    with lock:
+                        record = events.get(event_id)
                 if record is None:
                     self.send_json(404, {"error": "not_found", "field": None})
                 else:
@@ -258,6 +455,15 @@ def make_server(version_file, port=8080, env=None):
             failure = _validate(payload)
             if failure is not None:
                 self.send_json(*failure)
+                return
+            if database_configured:
+                try:
+                    self.ensure_database()
+                    status, record = _db_create_event(database_settings, payload)
+                except Exception as exc:
+                    self.send_database_error("database write", exc)
+                    return
+                self.send_json(status, record)
                 return
             # 4 and 5. Duplicate detection and creation share one critical section.
             with lock:
